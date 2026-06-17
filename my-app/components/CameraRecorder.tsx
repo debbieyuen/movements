@@ -11,24 +11,30 @@ type Landmark = {
 };
 
 type PoseFrame = {
+  frameIndex: number;
   t: number;
+  timeMs: number;
+  unixMs: number;
   landmarks: Landmark[];
   worldLandmarks: Landmark[];
 };
 
 function pickMimeType() {
   if (typeof window === 'undefined' || typeof MediaRecorder === 'undefined') return '';
+
   const candidates = [
     'video/webm;codecs=vp9',
     'video/webm;codecs=vp8',
     'video/webm',
     'video/mp4',
   ];
+
   return candidates.find((t) => MediaRecorder.isTypeSupported(t)) || '';
 }
 
 function serializeLandmarks(landmarks: any[] | undefined): Landmark[] {
   if (!landmarks) return [];
+
   return landmarks.map((l) => ({
     x: l.x,
     y: l.y,
@@ -51,17 +57,19 @@ export default function CameraRecorder({
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
+
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
 
   const poseRef = useRef<any>(null);
-  const drawingRef = useRef<any>(null);
+  const drawUtilsRef = useRef<any>(null);
   const poseLoopRef = useRef<number | null>(null);
   const poseBusyRef = useRef(false);
   const poseRunningRef = useRef(false);
   const recordingRef = useRef(false);
+  const recordingStartRef = useRef<number | null>(null);
   const poseFramesRef = useRef<PoseFrame[]>([]);
 
   const [mounted, setMounted] = useState(false);
@@ -92,12 +100,19 @@ export default function CameraRecorder({
   const ensurePose = async () => {
     if (poseRef.current) return poseRef.current;
 
-    const [{ Pose }, drawingUtils] = await Promise.all([
-      import('@mediapipe/pose'),
-      import('@mediapipe/drawing_utils'),
-    ]);
+    const poseModule: any = await import('@mediapipe/pose');
+    const drawingModule: any = await import('@mediapipe/drawing_utils');
 
-    const pose = new Pose({
+    const PoseCtor =
+      poseModule.Pose ?? poseModule.default?.Pose ?? poseModule.default ?? null;
+
+    if (!PoseCtor) {
+      throw new Error('Could not load MediaPipe Pose constructor.');
+    }
+
+    const drawingUtils = drawingModule.default ?? drawingModule;
+
+    const pose = new PoseCtor({
       locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
     });
 
@@ -126,21 +141,74 @@ export default function CameraRecorder({
 
       ctx.clearRect(0, 0, width, height);
 
-      const drawing = drawingRef.current;
-      if (results.poseLandmarks && drawing) {
-        drawing.drawConnectors(ctx, results.poseLandmarks, drawing.POSE_CONNECTIONS, {
-          color: '#00D084',
-          lineWidth: 4,
-        });
-        drawing.drawLandmarks(ctx, results.poseLandmarks, {
-          color: '#FF5A5F',
-          lineWidth: 2,
-        });
+      if (results.poseLandmarks) {
+        const drawing: any = drawUtilsRef.current ?? drawingUtils;
+
+        const drawConnectors =
+          drawing.drawConnectors ?? drawing.default?.drawConnectors;
+        const drawLandmarks =
+          drawing.drawLandmarks ?? drawing.default?.drawLandmarks;
+        const POSE_CONNECTIONS =
+          drawing.POSE_CONNECTIONS ?? drawing.default?.POSE_CONNECTIONS;
+
+        if (drawConnectors && drawLandmarks && POSE_CONNECTIONS) {
+          drawConnectors(ctx, results.poseLandmarks, POSE_CONNECTIONS, {
+            color: '#00ff88',
+            lineWidth: 6,
+          });
+
+          drawLandmarks(ctx, results.poseLandmarks, {
+            color: '#ffcc00',
+            lineWidth: 2,
+            radius: 4,
+          });
+        }
+
+        const lm = results.poseLandmarks as any[];
+        const labels = [
+          { i: 0, name: 'nose' },
+          { i: 11, name: 'left shoulder' },
+          { i: 12, name: 'right shoulder' },
+          { i: 13, name: 'left elbow' },
+          { i: 14, name: 'right elbow' },
+          { i: 15, name: 'left wrist' },
+          { i: 16, name: 'right wrist' },
+          { i: 23, name: 'left hip' },
+          { i: 24, name: 'right hip' },
+          { i: 25, name: 'left knee' },
+          { i: 26, name: 'right knee' },
+          { i: 27, name: 'left ankle' },
+          { i: 28, name: 'right ankle' },
+        ];
+
+        ctx.font = '16px Arial';
+        ctx.lineWidth = 4;
+
+        for (const item of labels) {
+          const p = lm[item.i];
+          if (!p) continue;
+          if (typeof p.visibility === 'number' && p.visibility < 0.5) continue;
+
+          const x = p.x * width;
+          const y = p.y * height;
+
+          ctx.strokeStyle = '#000000';
+          ctx.fillStyle = '#ffffff';
+          ctx.strokeText(item.name, x + 6, y - 6);
+          ctx.fillText(item.name, x + 6, y - 6);
+        }
       }
 
       if (recordingRef.current && results.poseLandmarks) {
+        const now = performance.now();
+        const start = recordingStartRef.current ?? now;
+        const frameIndex = poseFramesRef.current.length;
+
         const frame: PoseFrame = {
-          t: performance.now(),
+          frameIndex,
+          t: now,
+          timeMs: now - start,
+          unixMs: Date.now(),
           landmarks: serializeLandmarks(results.poseLandmarks),
           worldLandmarks: serializeLandmarks(results.poseWorldLandmarks),
         };
@@ -151,7 +219,7 @@ export default function CameraRecorder({
     });
 
     poseRef.current = pose;
-    drawingRef.current = drawingUtils as any;
+    drawUtilsRef.current = drawingUtils;
     setPoseReady(true);
 
     return pose;
@@ -161,7 +229,10 @@ export default function CameraRecorder({
     if (!poseRunningRef.current) return;
     if (!poseRef.current || !videoRef.current) return;
 
-    if (!poseBusyRef.current && videoRef.current.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+    if (
+      !poseBusyRef.current &&
+      videoRef.current.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+    ) {
       poseBusyRef.current = true;
       try {
         await poseRef.current.send({ image: videoRef.current });
@@ -241,6 +312,7 @@ export default function CameraRecorder({
     setDownloadName('');
     setKeypointsUrl('');
     setKeypointsName('');
+    recordingStartRef.current = performance.now();
 
     recordingRef.current = true;
 
@@ -293,6 +365,7 @@ export default function CameraRecorder({
 
     recorderRef.current?.stop();
     recorderRef.current = null;
+    recordingStartRef.current = null;
     setIsRecording(false);
   };
 

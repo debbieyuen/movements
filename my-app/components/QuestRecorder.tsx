@@ -3,7 +3,10 @@
 import { useEffect, useRef, useState } from 'react';
 
 type PoseSample = {
+  frameIndex: number;
   t: number;
+  timeMs: number;
+  unixMs: number;
   head?: TransformSample;
   leftController?: TransformSample;
   rightController?: TransformSample;
@@ -40,6 +43,7 @@ export default function QuestRecorder({
   const glRef = useRef<WebGLRenderingContext | null>(null);
   const refSpaceRef = useRef<XRReferenceSpace | null>(null);
   const samplesRef = useRef<PoseSample[]>([]);
+  const captureStartRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
 
   const [supported, setSupported] = useState<boolean | null>(null);
@@ -74,6 +78,7 @@ export default function QuestRecorder({
     sessionRef.current = null;
     refSpaceRef.current = null;
     glRef.current = null;
+    captureStartRef.current = null;
     setRecording(false);
   };
 
@@ -99,6 +104,7 @@ export default function QuestRecorder({
     setSampleCount(0);
     setDownloadUrl('');
     setDownloadName('');
+    captureStartRef.current = performance.now();
 
     const session = await navigator.xr.requestSession('immersive-vr', {
       requiredFeatures: ['local-floor'],
@@ -134,8 +140,14 @@ export default function QuestRecorder({
       const pose = frame.getViewerPose(rs);
       if (pose) {
         const headView = pose.views[0];
+        const start = captureStartRef.current ?? time;
+        const frameIndex = samplesRef.current.length;
+
         const sample: PoseSample = {
+          frameIndex,
           t: time,
+          timeMs: time - start,
+          unixMs: Date.now(),
           head: toTransform(headView.transform),
         };
 
