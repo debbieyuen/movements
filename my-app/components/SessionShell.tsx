@@ -39,8 +39,7 @@ export default function SessionShell({ sessionId }: { sessionId: string }) {
         <div className="card">
           <h1>Session {sessionId}</h1>
           <p>
-            Open this same URL on each device. Pick a role, start recording, and clap once at
-            the beginning for sync.
+            Open this URL on each device. Best to have at least 3 devices (front, left, right)
           </p>
 
           <div className="row wrap">

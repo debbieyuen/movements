@@ -4,6 +4,7 @@ from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
+import mani_skill.envs.tasks  
 
 MOTION_FILE = Path("received_frames/latest_h1_frame.json")
 
@@ -48,6 +49,8 @@ def main():
     env.reset()
 
     robot = get_robot(env)
+    print("robot qpos shape:", robot.get_qpos().shape)
+    print("robot qvel shape:", robot.get_qvel().shape)
 
     last_mtime = 0.0
     print(f"Watching {MOTION_FILE}")
