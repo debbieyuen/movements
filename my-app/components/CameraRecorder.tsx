@@ -72,6 +72,11 @@ export default function CameraRecorder({
   const recordingStartRef = useRef<number | null>(null);
   const poseFramesRef = useRef<PoseFrame[]>([]);
 
+  const wsRef = useRef<WebSocket | null>(null);
+  const liveFrameIndexRef = useRef(0);
+
+  const WS_URL = 'ws://127.0.0.1:8765';
+
   const [mounted, setMounted] = useState(false);
   const [mimeType, setMimeType] = useState('');
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
@@ -95,6 +100,58 @@ export default function CameraRecorder({
     const ctx = canvas?.getContext('2d');
     if (!canvas || !ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
+  };
+
+  const openSocket = () => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
+
+    const ws = new WebSocket(WS_URL);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log('WebSocket connected');
+    };
+
+    ws.onmessage = (event) => {
+      console.log('WebSocket server:', event.data);
+    };
+
+    ws.onerror = (event) => {
+      console.error('WebSocket error:', event);
+    };
+
+    ws.onclose = () => {
+      console.log('WebSocket closed');
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
+    };
+  };
+
+  const closeSocket = () => {
+    try {
+      wsRef.current?.close();
+    } catch {
+      // ignore
+    }
+    wsRef.current = null;
+  };
+
+  const sendPoseFrame = (results: any) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    const payload = {
+      sessionId,
+      role,
+      frameIndex: liveFrameIndexRef.current++,
+      timeMs: performance.now(),
+      unixMs: Date.now(),
+      landmarks: serializeLandmarks(results.poseLandmarks),
+      worldLandmarks: serializeLandmarks(results.poseWorldLandmarks),
+    };
+
+    ws.send(JSON.stringify(payload));
   };
 
   const ensurePose = async () => {
@@ -216,6 +273,11 @@ export default function CameraRecorder({
         poseFramesRef.current.push(frame);
         setKeypointCount(poseFramesRef.current.length);
       }
+
+      // sendPoseFrame(results);
+      if (recordingRef.current) {
+        sendPoseFrame(results);
+      }
     });
 
     poseRef.current = pose;
@@ -259,6 +321,8 @@ export default function CameraRecorder({
 
     if (videoRef.current) videoRef.current.srcObject = null;
 
+    closeSocket();
+
     setIsPreviewOn(false);
     clearOverlay();
   };
@@ -282,6 +346,8 @@ export default function CameraRecorder({
       await videoRef.current.play();
     }
 
+    // openSocket();
+
     poseRunningRef.current = true;
     poseLoopRef.current = window.requestAnimationFrame(startPoseLoop);
     setIsPreviewOn(true);
@@ -304,6 +370,8 @@ export default function CameraRecorder({
     const stream = streamRef.current;
     if (!stream) return;
 
+    openSocket();
+
     chunksRef.current = [];
     poseFramesRef.current = [];
     setKeypointCount(0);
@@ -313,6 +381,8 @@ export default function CameraRecorder({
     setKeypointsUrl('');
     setKeypointsName('');
     recordingStartRef.current = performance.now();
+    liveFrameIndexRef.current = 0;
+
 
     recordingRef.current = true;
 
@@ -366,6 +436,8 @@ export default function CameraRecorder({
     recorderRef.current?.stop();
     recorderRef.current = null;
     recordingStartRef.current = null;
+
+    closeSocket();
     setIsRecording(false);
   };
 
