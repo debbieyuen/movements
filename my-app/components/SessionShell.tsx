@@ -25,6 +25,11 @@ export default function SessionShell({ sessionId }: { sessionId: string }) {
   const roleRef = useRef<Role>(role); // avoid stale role in the socket callbacks
   roleRef.current = role;
 
+  // Countdown overlay ('3' | '2' | '1' | 'CLAP!' | null) + a trigger the
+  // recorder watches to auto-start when the host presses Go.
+  const [countdown, setCountdown] = useState<number | string | null>(null);
+  const [recordSignal, setRecordSignal] = useState(0);
+
   // const sessionUrl = useMemo(() => {
   //   if (typeof window === 'undefined') return '';
   //   return `${window.location.origin}/session/${sessionId}`;
@@ -41,6 +46,23 @@ export default function SessionShell({ sessionId }: { sessionId: string }) {
     let closed = false;
     let heartbeat: number | undefined;
 
+    // Runs on every device when the host presses Go. Start recording FIRST (so
+    // the clap is captured), then show 3 -> 2 -> 1 -> CLAP! as the cue.
+    const runCountdown = (secs: number) => {
+      setRecordSignal((s) => s + 1);
+      let n = secs;
+      setCountdown(n);
+      const iv = window.setInterval(() => {
+        n -= 1;
+        if (n > 0) setCountdown(n);
+        else if (n === 0) setCountdown('CLAP!');
+        else {
+          window.clearInterval(iv);
+          setCountdown(null);
+        }
+      }, 1000);
+    };
+
     const connect = () => {
       // window.location.hostname works for phones too (they load from the LAN IP).
       const ws = new WebSocket(`ws://${window.location.hostname}:8765`);
@@ -53,6 +75,7 @@ export default function SessionShell({ sessionId }: { sessionId: string }) {
         try {
           const m = JSON.parse(e.data);
           if (m.type === 'presence') setLiveRoles(m.roles || []);
+          else if (m.type === 'countdown') runCountdown(m.seconds || 3);
         } catch {
           // ignore non-JSON / non-presence messages
         }
@@ -98,8 +121,44 @@ export default function SessionShell({ sessionId }: { sessionId: string }) {
     alert('Session link copied');
   };
 
+  // Host presses Go: tell the server to broadcast a countdown to every device.
+  const pressGo = () => {
+    const ws = presenceWsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'go', seconds: 3 }));
+    } else {
+      alert('Not connected yet — wait for the cameras to show live.');
+    }
+  };
+
   return (
     <main className="page">
+      {countdown !== null && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            background: 'rgba(0, 0, 0, 0.65)',
+            zIndex: 1000,
+            pointerEvents: 'none',
+          }}
+        >
+          <div
+            style={{
+              fontSize: countdown === 'CLAP!' ? '16vh' : '28vh',
+              fontWeight: 800,
+              color: countdown === 'CLAP!' ? '#4ade80' : '#ffffff',
+              textShadow: '0 4px 24px rgba(0,0,0,0.6)',
+            }}
+          >
+            {countdown === 'CLAP!' ? '👏 CLAP!' : countdown}
+          </div>
+        </div>
+      )}
+
       <div className="shell">
         <div className="card">
           <h1>Session {sessionId}</h1>
@@ -133,12 +192,21 @@ export default function SessionShell({ sessionId }: { sessionId: string }) {
               </span>
             ))}
           </div>
+
+          <div className="row wrap" style={{ marginTop: 12 }}>
+            <button className="primary" onClick={pressGo} disabled={countdown !== null}>
+              ▶ Go — start all cameras + clap
+            </button>
+            <span className="roleHint" style={{ marginLeft: 8 }}>
+              Starts every connected device recording, then cues a clap to sync them.
+            </span>
+          </div>
         </div>
 
         {role === 'quest' ? (
           <QuestRecorder sessionId={sessionId} role={role} />
         ) : (
-          <CameraRecorder sessionId={sessionId} role={role} />
+          <CameraRecorder sessionId={sessionId} role={role} recordSignal={recordSignal} />
         )}
 
         <div className="grid2">

@@ -360,6 +360,18 @@ async def handle_client(websocket):
                     await _broadcast_presence()
                 continue
 
+            # "go" from the host: tell every device to run a countdown and
+            # auto-start recording, so all cameras capture the same take + clap.
+            if data.get("type") == "go":
+                countdown = json.dumps(
+                    {"type": "countdown", "seconds": int(data.get("seconds", 3))})
+                for ws in list(CLIENTS):
+                    try:
+                        await ws.send(countdown)
+                    except Exception:  # noqa: BLE001 - one dead socket can't block it
+                        pass
+                continue
+
             server_frame = {
                 "serverUnixMs": int(time.time() * 1000),
                 **data,

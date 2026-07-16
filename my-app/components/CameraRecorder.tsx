@@ -51,9 +51,11 @@ function makeFilename(sessionId: string, role: string, ext: string) {
 export default function CameraRecorder({
   sessionId,
   role,
+  recordSignal,
 }: {
   sessionId: string;
   role: string;
+  recordSignal?: number;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
@@ -476,6 +478,15 @@ export default function CameraRecorder({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Host's countdown fires: recordSignal increments -> auto-start recording.
+  // Ignores the initial value and no-ops if already recording.
+  useEffect(() => {
+    if (recordSignal && recordSignal > 0 && !recordingRef.current) {
+      startRecording();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordSignal]);
 
   return (
     <section className="card">
