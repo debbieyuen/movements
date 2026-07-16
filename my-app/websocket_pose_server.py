@@ -47,6 +47,17 @@ def _atomic_write_json(path: Path, obj: Any) -> None:
     print(f"  (atomic write to {path.name} kept failing: {last_err!r}; "
           f"skipped this frame, next one will refresh it)")
 
+
+def _role_slug(role: Any) -> str:
+    """Filesystem-safe camera name, e.g. 'Front Camera' -> 'front_camera'.
+
+    Used so each camera (front / left / right) gets its own output files
+    instead of all cameras overwriting the same latest_frame.json.
+    """
+    s = str(role if role not in (None, "?", "") else "unknown").strip().lower()
+    return "".join(c if (c.isalnum() or c in "-_") else "_" for c in s) or "unknown"
+
+
 # MuJoCo Gymnasium Humanoid-v5 actuated-joint order (qpos[7:24], 17 DOFs).
 # This MUST match the model's joint order, because play_latest_mujoco.py writes
 # these values positionally into qpos[7:24]. The Humanoid has NO ankle joints
@@ -335,9 +346,20 @@ async def handle_client(websocket):
             # freeze on the last frame. Log it and keep the connection alive.
             try:
                 # Save browser pose frame (atomic so readers never see a half-write).
+                # NOTE: this global file is still "last camera wins" -- the
+                # existing single-camera IK players read it and keep working.
                 _atomic_write_json(LATEST_FILE, server_frame)
 
                 with JSONL_FILE.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(server_frame) + "\n")
+
+                # ALSO keep a separate stream per camera so the front/left/right
+                # views no longer overwrite each other (needed for fusion later
+                # and to gather every camera's data now). Additive -- nothing
+                # above changes.
+                slug = _role_slug(server_frame.get("role"))
+                _atomic_write_json(OUT_DIR / f"latest_frame_{slug}.json", server_frame)
+                with (OUT_DIR / f"frames_{slug}.jsonl").open("a", encoding="utf-8") as f:
                     f.write(json.dumps(server_frame) + "\n")
 
                 # Convert to H1 live frame.

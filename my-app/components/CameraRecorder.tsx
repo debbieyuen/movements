@@ -75,6 +75,12 @@ export default function CameraRecorder({
   const wsRef = useRef<WebSocket | null>(null);
   const liveFrameIndexRef = useRef(0);
 
+  // The pose callback is registered once, so it captures the initial `role`.
+  // Mirror the current role into a ref (stable identity) so streamed frames are
+  // always tagged with the role currently selected in the dropdown.
+  const roleRef = useRef(role);
+  roleRef.current = role;
+
   const WS_URL = 'ws://127.0.0.1:8765';
 
   const [mounted, setMounted] = useState(false);
@@ -152,7 +158,7 @@ export default function CameraRecorder({
 
     const payload = {
       sessionId,
-      role,
+      role: roleRef.current,
       frameIndex: liveFrameIndexRef.current++,
       timeMs: performance.now(),
       unixMs: Date.now(),
