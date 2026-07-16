@@ -1,4 +1,7 @@
 # movements
+
+<img width="1160" height="428" alt="Screenshot 2026-06-22 090311" src="https://github.com/user-attachments/assets/38f03302-b4d0-4aa6-9e6b-d1e15f8f48e8" />
+
 This is a motion capture website to capture human joints, movements, and positions that can be directly mapped to the MuJoCo Humanoid 5 in ManiSkill and Unitree H1 robot in Isaac Sim. 
 
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
@@ -62,7 +65,7 @@ received_frames/latest_mujoco_frame.json
 ```
 
 ## ManiSkill UniTree H1 Robot (Terminal 4)
-Launch Isaac Sim and load the Unitree H1 environment.
+In ManiSkill, you must download all UniTree H1 asset. If using Isaac Sim, launch and load the Unitree H1 environment. 
 
 The retargeting pipeline generates which can be used by Isaac Sim, Isaac Lab, or ManiSkill
 ```bash
