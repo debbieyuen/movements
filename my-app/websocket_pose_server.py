@@ -17,6 +17,10 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 LATEST_FILE = OUT_DIR / "latest_frame.json"
 JSONL_FILE = OUT_DIR / "frames.jsonl"
+
+# Connected clients -> the camera role each has announced. Used for the presence
+# check: a camera is "live" if it holds an open connection and has said hello.
+CLIENTS: Dict[Any, Optional[str]] = {}
 LATEST_H1_FILE = OUT_DIR / "latest_h1_frame.json"
 LATEST_MUJOCO_FILE = OUT_DIR / "latest_mujoco_frame.json"
 
@@ -56,6 +60,17 @@ def _role_slug(role: Any) -> str:
     """
     s = str(role if role not in (None, "?", "") else "unknown").strip().lower()
     return "".join(c if (c.isalnum() or c in "-_") else "_" for c in s) or "unknown"
+
+
+async def _broadcast_presence() -> None:
+    """Tell every connected device which camera roles are currently live."""
+    roles = sorted({r for r in CLIENTS.values() if r})
+    msg = json.dumps({"type": "presence", "roles": roles})
+    for ws in list(CLIENTS):
+        try:
+            await ws.send(msg)
+        except Exception:  # noqa: BLE001 - a dead socket must not block the rest
+            pass
 
 
 # MuJoCo Gymnasium Humanoid-v5 actuated-joint order (qpos[7:24], 17 DOFs).
@@ -325,6 +340,7 @@ def pose_to_mujoco(server_frame: Dict[str, Any]) -> Dict[str, Any]:
 
 async def handle_client(websocket):
     print("Client connected")
+    CLIENTS[websocket] = None
 
     try:
         async for message in websocket:
@@ -332,6 +348,16 @@ async def handle_client(websocket):
                 data = json.loads(message)
             except json.JSONDecodeError:
                 await websocket.send(json.dumps({"ok": False, "error": "invalid json"}))
+                continue
+
+            # Presence pings (hello / heartbeat) announce a camera's role without
+            # being logged as pose frames. This drives the "who's live" check.
+            if data.get("type") in ("hello", "heartbeat"):
+                role = data.get("role")
+                changed = CLIENTS.get(websocket) != role
+                CLIENTS[websocket] = role
+                if data.get("type") == "hello" or changed:
+                    await _broadcast_presence()
                 continue
 
             server_frame = {
@@ -388,6 +414,9 @@ async def handle_client(websocket):
 
     except websockets.ConnectionClosed:
         print("Client disconnected")
+    finally:
+        CLIENTS.pop(websocket, None)
+        await _broadcast_presence()
 
 
 async def main():

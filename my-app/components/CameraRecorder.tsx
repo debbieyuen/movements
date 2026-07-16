@@ -81,8 +81,6 @@ export default function CameraRecorder({
   const roleRef = useRef(role);
   roleRef.current = role;
 
-  const WS_URL = 'ws://127.0.0.1:8765';
-
   const [mounted, setMounted] = useState(false);
   const [mimeType, setMimeType] = useState('');
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
@@ -111,7 +109,9 @@ export default function CameraRecorder({
   const openSocket = () => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
 
-    const ws = new WebSocket(WS_URL);
+    // Use the page's own host so recording works from phones on the LAN too
+    // (127.0.0.1 on a phone means the phone itself, not the server).
+    const ws = new WebSocket(`ws://${window.location.hostname}:8765`);
     wsRef.current = ws;
 
     ws.onopen = () => {

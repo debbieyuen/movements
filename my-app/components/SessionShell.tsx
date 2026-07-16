@@ -1,7 +1,7 @@
 'use client';
 
 // import { useEffect, useState } from 'react';
-import { useMemo, useEffect, useState } from 'react';
+import { useMemo, useEffect, useRef, useState } from 'react';
 import CameraRecorder from './CameraRecorder';
 import QuestRecorder from './QuestRecorder';
 
@@ -17,6 +17,14 @@ const roles: { id: Role; label: string; help: string }[] = [
 export default function SessionShell({ sessionId }: { sessionId: string }) {
   const [role, setRole] = useState<Role>('front-camera');
 
+  // --- Presence: a lightweight socket, separate from the recording socket, so
+  // each device announces its role on page load and the host can see which
+  // cameras are live BEFORE recording. Purely additive; recording is untouched.
+  const [liveRoles, setLiveRoles] = useState<string[]>([]);
+  const presenceWsRef = useRef<WebSocket | null>(null);
+  const roleRef = useRef<Role>(role); // avoid stale role in the socket callbacks
+  roleRef.current = role;
+
   // const sessionUrl = useMemo(() => {
   //   if (typeof window === 'undefined') return '';
   //   return `${window.location.origin}/session/${sessionId}`;
@@ -26,6 +34,63 @@ export default function SessionShell({ sessionId }: { sessionId: string }) {
   useEffect(() => {
     setSessionUrl(`${window.location.origin}/session/${sessionId}`);
   }, [sessionId]);
+
+  // Open the presence socket on load; announce our role + heartbeat; listen for
+  // the server's live-roles broadcast. Reconnects if it drops.
+  useEffect(() => {
+    let closed = false;
+    let heartbeat: number | undefined;
+
+    const connect = () => {
+      // window.location.hostname works for phones too (they load from the LAN IP).
+      const ws = new WebSocket(`ws://${window.location.hostname}:8765`);
+      presenceWsRef.current = ws;
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'hello', role: roleRef.current, sessionId }));
+      };
+      ws.onmessage = (e) => {
+        try {
+          const m = JSON.parse(e.data);
+          if (m.type === 'presence') setLiveRoles(m.roles || []);
+        } catch {
+          // ignore non-JSON / non-presence messages
+        }
+      };
+      ws.onclose = () => {
+        if (!closed) window.setTimeout(connect, 1000);
+      };
+      ws.onerror = () => {
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+      };
+    };
+
+    connect();
+    heartbeat = window.setInterval(() => {
+      const ws = presenceWsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'heartbeat', role: roleRef.current, sessionId }));
+      }
+    }, 2000);
+
+    return () => {
+      closed = true;
+      if (heartbeat) window.clearInterval(heartbeat);
+      presenceWsRef.current?.close();
+    };
+  }, [sessionId]);
+
+  // Re-announce immediately when the role dropdown changes.
+  useEffect(() => {
+    const ws = presenceWsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'hello', role, sessionId }));
+    }
+  }, [role, sessionId]);
 
   const copyLink = async () => {
     if (!sessionUrl) return;
@@ -58,6 +123,15 @@ export default function SessionShell({ sessionId }: { sessionId: string }) {
 
           <div className="roleHint">
             {roles.find((r) => r.id === role)?.help}
+          </div>
+
+          <div className="row wrap" style={{ marginTop: 12, gap: 16 }}>
+            <strong style={{ marginRight: 4 }}>Cameras live:</strong>
+            {roles.map((r) => (
+              <span key={r.id} title={liveRoles.includes(r.id) ? 'connected' : 'not connected'}>
+                {liveRoles.includes(r.id) ? '🟢' : '⚪'} {r.label}
+              </span>
+            ))}
           </div>
         </div>
 
