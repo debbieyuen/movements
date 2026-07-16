@@ -125,6 +125,15 @@ export default function CameraRecorder({
       if (wsRef.current === ws) {
         wsRef.current = null;
       }
+      // If the socket drops while we're still recording (e.g. the server
+      // hiccups on a frame), reconnect so streaming — and the robot — resume
+      // instead of silently freezing on the last frame.
+      if (recordingRef.current) {
+        console.log('Still recording; reconnecting WebSocket in 500ms...');
+        window.setTimeout(() => {
+          if (recordingRef.current) openSocket();
+        }, 500);
+      }
     };
   };
 
@@ -343,7 +352,14 @@ export default function CameraRecorder({
 
     if (videoRef.current) {
       videoRef.current.srcObject = stream;
-      await videoRef.current.play();
+      try {
+        await videoRef.current.play();
+      } catch (err) {
+        // A rapid stop/start (or the autoPlay attribute) can interrupt an
+        // in-flight play() with an AbortError. That is benign — the newer
+        // load wins — so swallow it and rethrow anything else.
+        if ((err as { name?: string })?.name !== 'AbortError') throw err;
+      }
     }
 
     // openSocket();

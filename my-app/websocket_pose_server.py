@@ -20,27 +20,71 @@ JSONL_FILE = OUT_DIR / "frames.jsonl"
 LATEST_H1_FILE = OUT_DIR / "latest_h1_frame.json"
 LATEST_MUJOCO_FILE = OUT_DIR / "latest_mujoco_frame.json"
 
+
+def _atomic_write_json(path: Path, obj: Any) -> None:
+    """Write JSON via a temp file + atomic rename.
+
+    Consumers (the playback scripts) poll these files at high frequency. A plain
+    write_text truncates then fills the file, so a reader can catch it empty and
+    hit "Expecting value: line 1 column 1". os.replace (Path.replace) swaps the
+    finished file in atomically, so readers only ever see a complete document.
+    """
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+    # On Windows, os.replace raises PermissionError ("Access is denied") if a
+    # reader (the playback scripts polling these files) happens to have the
+    # destination open at that instant. It is transient, so retry briefly
+    # before giving up. Never let it propagate: a single failed swap must not
+    # tear down the client connection.
+    last_err: Optional[Exception] = None
+    for _ in range(40):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError as e:
+            last_err = e
+            time.sleep(0.005)
+    print(f"  (atomic write to {path.name} kept failing: {last_err!r}; "
+          f"skipped this frame, next one will refresh it)")
+
+# MuJoCo Gymnasium Humanoid-v5 actuated-joint order (qpos[7:24], 17 DOFs).
+# This MUST match the model's joint order, because play_latest_mujoco.py writes
+# these values positionally into qpos[7:24]. The Humanoid has NO ankle joints
+# and TWO DOFs per shoulder (shoulder1 + shoulder2).
 MUJOCO_QPOS_NAMES = [
-    "torso_yaw",
-    "torso_pitch",
-    "torso_roll",
-    "left_hip_yaw",
-    "left_hip_roll",
-    "left_hip_pitch",
-    "left_knee",
-    "left_ankle_pitch",
-    "right_hip_yaw",
-    "right_hip_roll",
-    "right_hip_pitch",
+    "abdomen_y",
+    "abdomen_z",
+    "abdomen_x",
+    "right_hip_x",
+    "right_hip_z",
+    "right_hip_y",
     "right_knee",
-    "right_ankle_pitch",
-    "left_shoulder_pitch",
-    "right_shoulder_pitch",
-    "left_elbow",
+    "left_hip_x",
+    "left_hip_z",
+    "left_hip_y",
+    "left_knee",
+    "right_shoulder1",
+    "right_shoulder2",
     "right_elbow",
+    "left_shoulder1",
+    "left_shoulder2",
+    "left_elbow",
 ]
 
 MUJOCO_QVEL_NAMES = MUJOCO_QPOS_NAMES[:]
+
+# --- Retargeting tuning knobs ------------------------------------------------
+# The Humanoid's shoulder1/shoulder2 joints are on DIAGONAL axes and the knee/
+# elbow flex toward NEGATIVE angles, so a naive mapping can drive a joint the
+# wrong way (e.g. "lift arm -> arm goes backward"). Watch the MuJoCo window and
+# flip any joint that moves opposite your body by changing its sign (1.0 -> -1.0).
+MJ_SIGN = {
+    "shoulder1": -1.0,  # arm raise (front/back). Flip if arms swing backward.
+    "shoulder2": 1.0,   # arm spread (in/out). Flip if arms cross the wrong way.
+    "elbow": -1.0,      # elbow bend. Flip if the forearm bends the wrong way.
+    "knee": -1.0,       # knee bend (Humanoid knees flex negative).
+    "hip_pitch": 1.0,   # leg forward/back.
+}
 
 _LAST_MUJOCO_QPOS: Optional[List[float]] = None
 _LAST_MUJOCO_TS_MS: Optional[int] = None
@@ -218,24 +262,28 @@ def pose_to_mujoco(server_frame: Dict[str, Any]) -> Dict[str, Any]:
         right_hip_pitch = _clamp(-0.35 * right_knee, -0.8, 0.8)
         right_ankle_pitch = _clamp(-0.25 * right_knee, -0.8, 0.8)
 
+    # Emit in Humanoid-v5 joint order (see MUJOCO_QPOS_NAMES). The MuJoCo humanoid
+    # has no ankle joints, so ankle values are dropped; each shoulder takes two DOFs
+    # (pitch -> shoulder1, roll -> shoulder2). Per-joint direction is corrected via
+    # MJ_SIGN so you can flip any joint that moves the wrong way in the viewer.
     mujoco_qpos = [
-        torso_yaw,
-        torso_pitch,
-        torso_roll,
-        left_hip_yaw,
-        left_hip_roll,
-        left_hip_pitch,
-        left_knee,
-        left_ankle_pitch,
-        right_hip_yaw,
-        right_hip_roll,
-        right_hip_pitch,
-        right_knee,
-        right_ankle_pitch,
-        left_shoulder_pitch,
-        right_shoulder_pitch,
-        left_elbow,
-        right_elbow,
+        torso_pitch,                               # abdomen_y (forward/back bend)
+        torso_yaw,                                 # abdomen_z
+        torso_roll,                                # abdomen_x (side lean)
+        right_hip_roll,                            # right_hip_x
+        right_hip_yaw,                             # right_hip_z
+        MJ_SIGN["hip_pitch"] * right_hip_pitch,    # right_hip_y
+        MJ_SIGN["knee"] * right_knee,              # right_knee
+        left_hip_roll,                             # left_hip_x
+        left_hip_yaw,                              # left_hip_z
+        MJ_SIGN["hip_pitch"] * left_hip_pitch,     # left_hip_y
+        MJ_SIGN["knee"] * left_knee,               # left_knee
+        MJ_SIGN["shoulder1"] * right_shoulder_pitch,  # right_shoulder1
+        MJ_SIGN["shoulder2"] * right_shoulder_roll,   # right_shoulder2
+        MJ_SIGN["elbow"] * right_elbow,               # right_elbow
+        MJ_SIGN["shoulder1"] * left_shoulder_pitch,   # left_shoulder1
+        MJ_SIGN["shoulder2"] * left_shoulder_roll,    # left_shoulder2
+        MJ_SIGN["elbow"] * left_elbow,                # left_elbow
     ]
 
     global _LAST_MUJOCO_QPOS, _LAST_MUJOCO_TS_MS
@@ -279,22 +327,29 @@ async def handle_client(websocket):
                 "serverUnixMs": int(time.time() * 1000),
                 **data,
             }
-
-            # Save browser pose frame.
-            LATEST_FILE.write_text(json.dumps(server_frame, indent=2), encoding="utf-8")
-
-            with JSONL_FILE.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(server_frame) + "\n")
-
-            # Convert to H1 live frame.
-            h1_frame = pose_to_h1(server_frame)
-            LATEST_H1_FILE.write_text(json.dumps(h1_frame, indent=2), encoding="utf-8")
-
-            # Convert directly to a MuJoCo-friendly frame.
-            mujoco_frame = pose_to_mujoco(server_frame)
-            LATEST_MUJOCO_FILE.write_text(json.dumps(mujoco_frame, indent=2), encoding="utf-8")
-
             frame_index = server_frame.get("frameIndex", "?")
+
+            # Any failure while processing ONE frame (a file lock, a bad
+            # landmark, a converter edge case) must never break the socket:
+            # if it did, the browser would stop streaming and the robot would
+            # freeze on the last frame. Log it and keep the connection alive.
+            try:
+                # Save browser pose frame (atomic so readers never see a half-write).
+                _atomic_write_json(LATEST_FILE, server_frame)
+
+                with JSONL_FILE.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(server_frame) + "\n")
+
+                # Convert to H1 live frame.
+                h1_frame = pose_to_h1(server_frame)
+                _atomic_write_json(LATEST_H1_FILE, h1_frame)
+
+                # Convert directly to a MuJoCo-friendly frame.
+                mujoco_frame = pose_to_mujoco(server_frame)
+                _atomic_write_json(LATEST_MUJOCO_FILE, mujoco_frame)
+            except Exception as e:  # noqa: BLE001 - keep the stream alive no matter what
+                print(f"  (frame {frame_index} processing error, skipped: {e!r})")
+
             role = server_frame.get("role", "?")
             time_ms = server_frame.get("timeMs", "?")
             print(f"Received frame {frame_index} from {role} at {time_ms} ms")

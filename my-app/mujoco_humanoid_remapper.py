@@ -61,7 +61,7 @@ def pose_to_mujoco(frame: Dict[str, Any]) -> Dict[str, Any]:
         _get(h1_qpos, 7),   # torso_yaw   -> abdomen_z
         _get(h1_qpos, 9),   # torso_roll  -> abdomen_x
 
-        _get(h1_qpos, 21),  # right_hip_roll  -> right_hip_x
+        _get(h1_qpos, 27),  # right_hip_roll  -> right_hip_x
         _get(h1_qpos, 26),  # right_hip_yaw   -> right_hip_z
         _get(h1_qpos, 28),  # right_hip_pitch -> right_hip_y
         _get(h1_qpos, 29),  # right_knee      -> right_knee
@@ -85,7 +85,7 @@ def pose_to_mujoco(frame: Dict[str, Any]) -> Dict[str, Any]:
         _get(h1_qvel, 7),
         _get(h1_qvel, 9),
 
-        _get(h1_qvel, 21),
+        _get(h1_qvel, 27),
         _get(h1_qvel, 26),
         _get(h1_qvel, 28),
         _get(h1_qvel, 29),
