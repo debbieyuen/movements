@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { getWsUrl } from './wsUrl';
 
 type Landmark = {
   x: number;
@@ -111,9 +112,8 @@ export default function CameraRecorder({
   const openSocket = () => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
 
-    // Use the page's own host so recording works from phones on the LAN too
-    // (127.0.0.1 on a phone means the phone itself, not the server).
-    const ws = new WebSocket(`ws://${window.location.hostname}:8765`);
+    // Configurable so phones over HTTPS can reach a tunneled server (wss).
+    const ws = new WebSocket(getWsUrl());
     wsRef.current = ws;
 
     ws.onopen = () => {

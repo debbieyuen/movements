@@ -4,6 +4,7 @@
 import { useMemo, useEffect, useRef, useState } from 'react';
 import CameraRecorder from './CameraRecorder';
 import QuestRecorder from './QuestRecorder';
+import { getWsUrl } from './wsUrl';
 
 type Role = 'left-phone' | 'front-camera' | 'right-phone' | 'quest';
 
@@ -64,8 +65,7 @@ export default function SessionShell({ sessionId }: { sessionId: string }) {
     };
 
     const connect = () => {
-      // window.location.hostname works for phones too (they load from the LAN IP).
-      const ws = new WebSocket(`ws://${window.location.hostname}:8765`);
+      const ws = new WebSocket(getWsUrl());
       presenceWsRef.current = ws;
 
       ws.onopen = () => {
