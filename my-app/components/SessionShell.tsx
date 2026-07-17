@@ -4,7 +4,7 @@
 import { useMemo, useEffect, useRef, useState } from 'react';
 import CameraRecorder from './CameraRecorder';
 import QuestRecorder from './QuestRecorder';
-import { getWsUrl } from './wsUrl';
+import { getWsUrl, normalizeWsUrl } from './wsUrl';
 
 type Role = 'left-phone' | 'front-camera' | 'right-phone' | 'quest';
 
@@ -30,6 +30,16 @@ export default function SessionShell({ sessionId }: { sessionId: string }) {
   // recorder watches to auto-start when the host presses Go.
   const [countdown, setCountdown] = useState<number | string | null>(null);
   const [recordSignal, setRecordSignal] = useState(0);
+
+  // Server (tunnel) URL, editable at runtime -- no Vercel rebuild needed.
+  const [wsInput, setWsInput] = useState('');
+  useEffect(() => {
+    try {
+      setWsInput(localStorage.getItem('wsUrl') || getWsUrl());
+    } catch {
+      setWsInput(getWsUrl());
+    }
+  }, []);
 
   // const sessionUrl = useMemo(() => {
   //   if (typeof window === 'undefined') return '';
@@ -117,8 +127,26 @@ export default function SessionShell({ sessionId }: { sessionId: string }) {
 
   const copyLink = async () => {
     if (!sessionUrl) return;
-    await navigator.clipboard.writeText(sessionUrl);
-    alert('Session link copied');
+    let link = sessionUrl;
+    try {
+      const w = localStorage.getItem('wsUrl');
+      if (w) link += '?ws=' + encodeURIComponent(w);
+    } catch {
+      // ignore
+    }
+    await navigator.clipboard.writeText(link);
+    alert('Session link copied (includes the server URL for the other devices)');
+  };
+
+  // Save the tunnel URL and reload so every socket picks it up. No redeploy.
+  const setServer = () => {
+    const n = normalizeWsUrl(wsInput);
+    try {
+      localStorage.setItem('wsUrl', n);
+    } catch {
+      // ignore
+    }
+    window.location.reload();
   };
 
   // Host presses Go: tell the server to broadcast a countdown to every device.
@@ -182,6 +210,18 @@ export default function SessionShell({ sessionId }: { sessionId: string }) {
 
           <div className="roleHint">
             {roles.find((r) => r.id === role)?.help}
+          </div>
+
+          <div className="row wrap" style={{ marginTop: 12, gap: 8, alignItems: 'center' }}>
+            <strong>Server URL:</strong>
+            <input
+              value={wsInput}
+              onChange={(e) => setWsInput(e.target.value)}
+              placeholder="https://xxxx.trycloudflare.com"
+              style={{ minWidth: 300, padding: '4px 8px' }}
+            />
+            <button className="secondary" onClick={setServer}>Set</button>
+            <span className="roleHint">paste your current tunnel URL, then Set (no redeploy)</span>
           </div>
 
           <div className="row wrap" style={{ marginTop: 12, gap: 16 }}>
