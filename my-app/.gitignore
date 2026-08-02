@@ -39,3 +39,15 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# fetched MediaPipe runtime assets (scripts/fetch-assets.mjs)
+/public/mediapipe/
+/public/models/
+
+# capture data
+received_frames/
+dataset/
+*.webm
+*.task
+__pycache__/
+*.pyc

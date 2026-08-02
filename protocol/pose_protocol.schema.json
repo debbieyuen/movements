@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/debbieyuen/movements/protocol/pose_protocol.schema.json",
+  "title": "movements pose protocol v2",
+  "description": "Wire and on-disk pose frame formats. Conventions: right-handed, z-up, gravity -z, meters, quaternions wxyz, tMs = milliseconds since the client's stream/recording epoch. MediaPipe raw frames ('mp-camera': x image-right, y image-DOWN, z away-from-camera, hip-centered meters) are converted exactly once, server-side, to 'zup-xfwd' (X forward/toward-camera, Y left, Z up) via X=-s*z, Y=x, Z=-y with s=depthScale.",
+  "$defs": {
+    "landmark4": {
+      "type": "array",
+      "description": "[x, y, z, visibility]",
+      "items": { "type": "number" },
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "landmarks33": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/landmark4" },
+      "minItems": 33,
+      "maxItems": 33
+    },
+    "poseFrameWire": {
+      "type": "object",
+      "description": "Client -> server pose frame (protocol v2). Coordinates are raw MediaPipe world landmarks; the client never transforms axes.",
+      "properties": {
+        "v": { "const": 2 },
+        "type": { "const": "pose" },
+        "sessionId": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 },
+        "seq": { "type": "integer", "minimum": 0 },
+        "tMs": { "type": "number", "minimum": 0, "description": "ms since this client's stream epoch" },
+        "unixMs": { "type": "integer", "description": "client wall clock, ms" },
+        "coord": { "const": "mp-camera" },
+        "world": { "$ref": "#/$defs/landmarks33" },
+        "norm": { "$ref": "#/$defs/landmarks33", "description": "optional normalized image-space landmarks" }
+      },
+      "required": ["v", "type", "sessionId", "role", "seq", "tMs", "unixMs", "coord", "world"],
+      "additionalProperties": false
+    },
+    "poseFrameLive": {
+      "type": "object",
+      "description": "Server-persisted frame (live/latest_pose.json and session jsonl). Always canonical z-up.",
+      "properties": {
+        "v": { "const": 2 },
+        "sessionId": { "type": "string" },
+        "role": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 0 },
+        "tMs": { "type": "number" },
+        "unixMs": { "type": "integer" },
+        "serverUnixMs": { "type": "integer" },
+        "coord": { "const": "zup-xfwd" },
+        "meta": {
+          "type": "object",
+          "properties": {
+            "depthScale": { "type": "number", "exclusiveMinimum": 0 },
+            "source": { "type": "string", "description": "landmark model identifier, e.g. 'mediapipe-pose-legacy' or 'mediapipe-tasks-vision/pose_landmarker_full'" }
+          },
+          "required": ["depthScale", "source"]
+        },
+        "world": { "$ref": "#/$defs/landmarks33" }
+      },
+      "required": ["v", "sessionId", "role", "seq", "tMs", "unixMs", "serverUnixMs", "coord", "meta", "world"],
+      "additionalProperties": false
+    }
+  }
+}

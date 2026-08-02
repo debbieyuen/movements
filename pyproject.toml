@@ -1,0 +1,26 @@
+[project]
+name = "movements"
+version = "2.0.0"
+description = "Single-camera human motion capture -> Unitree H1 motion datasets + live MuJoCo demo"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "mujoco",
+    "robot_descriptions",
+    "pydantic>=2",
+    "fastapi",
+    "uvicorn[standard]",
+    "websockets",
+    "imageio[ffmpeg]",
+    "opencv-python-headless",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "jsonschema", "httpx"]
+
+[tool.setuptools]
+packages = ["mocap", "mocap.exporters", "server"]
+
+[tool.pytest.ini_options]
+testpaths = ["server/tests", "mocap/tests"]

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import math
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -9,11 +10,21 @@ import websockets
 
 from live_h1_remapper import pose_to_h1
 
+# The shared protocol package lives at the repo root (one level up).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from server.protocol import build_live_frame  # noqa: E402
+
 HOST = "0.0.0.0"
 PORT = 8765
 
 OUT_DIR = Path("received_frames")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Canonical v2 live frame (z-up, see server/protocol.py). This is the file
+# new consumers should read; everything under received_frames/ is legacy.
+LIVE_DIR = Path("live")
+LIVE_DIR.mkdir(parents=True, exist_ok=True)
+LIVE_POSE_FILE = LIVE_DIR / "latest_pose.json"
 
 LATEST_FILE = OUT_DIR / "latest_frame.json"
 JSONL_FILE = OUT_DIR / "frames.jsonl"
@@ -383,6 +394,14 @@ async def handle_client(websocket):
             # if it did, the browser would stop streaming and the robot would
             # freeze on the last frame. Log it and keep the connection alive.
             try:
+                # Canonical v2 frame: axes converted to z-up exactly once,
+                # here. New consumers (live_viewer / play_latest_h1_mujoco_ik)
+                # read this file and never re-guess coordinate conventions.
+                live_frame = build_live_frame(
+                    server_frame, server_unix_ms=server_frame["serverUnixMs"])
+                if live_frame is not None:
+                    _atomic_write_json(LIVE_POSE_FILE, live_frame)
+
                 # Save browser pose frame (atomic so readers never see a half-write).
                 # NOTE: this global file is still "last camera wins" -- the
                 # existing single-camera IK players read it and keep working.

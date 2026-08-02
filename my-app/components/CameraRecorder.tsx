@@ -1,49 +1,37 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
-import { getWsUrl } from './wsUrl';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import ErrorBanner from './ErrorBanner';
+import { useCamera } from '../hooks/useCamera';
+import { usePose, type PoseResult } from '../hooks/usePose';
+import { useRecorder } from '../hooks/useRecorder';
+import { usePoseSocket } from '../hooks/usePoseSocket';
+import { useUploader } from '../hooks/useUploader';
+import { POSE_SOURCE, toLandmark4, type Landmark4 } from '../lib/protocol';
 
-type Landmark = {
-  x: number;
-  y: number;
-  z: number;
-  visibility?: number;
-  presence?: number;
-};
-
-type PoseFrame = {
-  frameIndex: number;
-  t: number;
-  timeMs: number;
+type KeypointFrame = {
+  seq: number;
+  tMs: number; // ms since recording start -- SAME meaning as the wire
   unixMs: number;
-  landmarks: Landmark[];
-  worldLandmarks: Landmark[];
+  world: Landmark4[];
+  norm: Landmark4[];
 };
 
-function pickMimeType() {
-  if (typeof window === 'undefined' || typeof MediaRecorder === 'undefined') return '';
-
-  const candidates = [
-    'video/webm;codecs=vp9',
-    'video/webm;codecs=vp8',
-    'video/webm',
-    'video/mp4',
-  ];
-
-  return candidates.find((t) => MediaRecorder.isTypeSupported(t)) || '';
-}
-
-function serializeLandmarks(landmarks: any[] | undefined): Landmark[] {
-  if (!landmarks) return [];
-
-  return landmarks.map((l) => ({
-    x: l.x,
-    y: l.y,
-    z: l.z,
-    visibility: typeof l.visibility === 'number' ? l.visibility : undefined,
-    presence: typeof l.presence === 'number' ? l.presence : undefined,
-  }));
-}
+const OVERLAY_LABELS = [
+  { i: 0, name: 'nose' },
+  { i: 11, name: 'left shoulder' },
+  { i: 12, name: 'right shoulder' },
+  { i: 13, name: 'left elbow' },
+  { i: 14, name: 'right elbow' },
+  { i: 15, name: 'left wrist' },
+  { i: 16, name: 'right wrist' },
+  { i: 23, name: 'left hip' },
+  { i: 24, name: 'right hip' },
+  { i: 25, name: 'left knee' },
+  { i: 26, name: 'right knee' },
+  { i: 27, name: 'left ankle' },
+  { i: 28, name: 'right ankle' },
+];
 
 function makeFilename(sessionId: string, role: string, ext: string) {
   return `${sessionId}_${role}_${new Date().toISOString().replace(/[:.]/g, '-')}.${ext}`;
@@ -60,477 +48,396 @@ export default function CameraRecorder({
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
+  const drawingRef = useRef<{
+    DrawingUtils: typeof import('@mediapipe/tasks-vision').DrawingUtils;
+    POSE_CONNECTIONS: (typeof import('@mediapipe/tasks-vision').PoseLandmarker)['POSE_CONNECTIONS'];
+  } | null>(null);
 
-  const streamRef = useRef<MediaStream | null>(null);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const timerRef = useRef<number | null>(null);
+  const cam = useCamera();
+  const pose = usePose(videoRef);
+  const socket = usePoseSocket(sessionId, role);
+  const uploader = useUploader();
 
-  const poseRef = useRef<any>(null);
-  const drawUtilsRef = useRef<any>(null);
-  const poseLoopRef = useRef<number | null>(null);
-  const poseBusyRef = useRef(false);
-  const poseRunningRef = useRef(false);
   const recordingRef = useRef(false);
-  const recordingStartRef = useRef<number | null>(null);
-  const poseFramesRef = useRef<PoseFrame[]>([]);
-
-  const wsRef = useRef<WebSocket | null>(null);
-  const liveFrameIndexRef = useRef(0);
-
-  // The pose callback is registered once, so it captures the initial `role`.
-  // Mirror the current role into a ref (stable identity) so streamed frames are
-  // always tagged with the role currently selected in the dropdown.
-  const roleRef = useRef(role);
-  roleRef.current = role;
-
-  const [mounted, setMounted] = useState(false);
-  const [mimeType, setMimeType] = useState('');
-  const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
-  const [isPreviewOn, setIsPreviewOn] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [seconds, setSeconds] = useState(0);
-  const [downloadUrl, setDownloadUrl] = useState('');
-  const [downloadName, setDownloadName] = useState('');
-  const [keypointsUrl, setKeypointsUrl] = useState('');
-  const [keypointsName, setKeypointsName] = useState('');
-  const [keypointCount, setKeypointCount] = useState(0);
-  const [poseReady, setPoseReady] = useState(false);
-
+  const keypointsRef = useRef<KeypointFrame[]>([]);
+  const mirrored = cam.facing === 'user';
+  const mirroredRef = useRef(mirrored);
   useEffect(() => {
-    setMounted(true);
-    setMimeType(pickMimeType());
+    mirroredRef.current = mirrored;
+  }, [mirrored]);
+
+  const [isPreviewOn, setIsPreviewOn] = useState(false);
+  const [fallbackDownloads, setFallbackDownloads] = useState<
+    { url: string; name: string }[]
+  >([]);
+
+  // What the motion IS, in words. A vision-language-action model needs the
+  // language half; relabelling a batch of clips after the fact is miserable,
+  // so capture it at record time.
+  const [label, setLabel] = useState('');
+  const [notes, setNotes] = useState('');
+
+  const rec = useRecorder(() => {
+    // t=0 for this take: reset the pose epoch the moment recording starts, so
+    // tMs in the wire frames and the keypoints file both start near zero.
+    pose.resetEpoch();
+    keypointsRef.current = [];
+    recordingRef.current = true;
+  });
+
+  // Load the drawing utilities once (browser-only module).
+  useEffect(() => {
+    let cancelled = false;
+    void import('@mediapipe/tasks-vision').then((m) => {
+      if (!cancelled) {
+        drawingRef.current = {
+          DrawingUtils: m.DrawingUtils,
+          POSE_CONNECTIONS: m.PoseLandmarker.POSE_CONNECTIONS,
+        };
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  const clearOverlay = () => {
-    const canvas = overlayRef.current;
-    const ctx = canvas?.getContext('2d');
-    if (!canvas || !ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-  };
+  const drawOverlay = useCallback((r: PoseResult) => {
+    const video = videoRef.current;
+    const overlay = overlayRef.current;
+    const drawing = drawingRef.current;
+    if (!video || !overlay) return;
 
-  const openSocket = () => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
+    const width = video.videoWidth || 1280;
+    const height = video.videoHeight || 720;
+    if (overlay.width !== width) overlay.width = width;
+    if (overlay.height !== height) overlay.height = height;
 
-    // Configurable so phones over HTTPS can reach a tunneled server (wss).
-    const ws = new WebSocket(getWsUrl());
-    wsRef.current = ws;
+    const ctx = overlay.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, width, height);
 
-    ws.onopen = () => {
-      console.log('WebSocket connected');
-    };
+    if (drawing) {
+      const du = new drawing.DrawingUtils(ctx);
+      du.drawConnectors(r.landmarks, drawing.POSE_CONNECTIONS, {
+        color: '#00ff88',
+        lineWidth: 6,
+      });
+      du.drawLandmarks(r.landmarks, { color: '#ffcc00', lineWidth: 2, radius: 4 });
+    }
 
-    ws.onmessage = (event) => {
-      console.log('WebSocket server:', event.data);
-    };
-
-    ws.onerror = (event) => {
-      console.error('WebSocket error:', event);
-    };
-
-    ws.onclose = () => {
-      console.log('WebSocket closed');
-      if (wsRef.current === ws) {
-        wsRef.current = null;
+    // Joint labels. The canvas is CSS-mirrored together with the video for
+    // front cameras, so text is pre-flipped here to stay readable.
+    ctx.font = '16px Arial';
+    ctx.lineWidth = 4;
+    const flip = mirroredRef.current;
+    for (const item of OVERLAY_LABELS) {
+      const p = r.landmarks[item.i];
+      if (!p) continue;
+      if (typeof p.visibility === 'number' && p.visibility < 0.5) continue;
+      const x = p.x * width;
+      const y = p.y * height;
+      ctx.strokeStyle = '#000000';
+      ctx.fillStyle = '#ffffff';
+      if (flip) {
+        ctx.save();
+        ctx.scale(-1, 1);
+        ctx.strokeText(item.name, -(x - 6), y - 6);
+        ctx.fillText(item.name, -(x - 6), y - 6);
+        ctx.restore();
+      } else {
+        ctx.strokeText(item.name, x + 6, y - 6);
+        ctx.fillText(item.name, x + 6, y - 6);
       }
-      // If the socket drops while we're still recording (e.g. the server
-      // hiccups on a frame), reconnect so streaming — and the robot — resume
-      // instead of silently freezing on the last frame.
+    }
+  }, []);
+
+  // One subscription handles overlay + local keypoint log + live streaming.
+  // Subscribe ONCE: `pose` and `socket` are fresh objects each render, so
+  // depending on them would tear down and re-register the callback (and the
+  // pose loop's consumer) on every state update. Read them through a ref.
+  const frameDepsRef = useRef({ drawOverlay, sendFrame: socket.sendFrame });
+  useEffect(() => {
+    frameDepsRef.current = { drawOverlay, sendFrame: socket.sendFrame };
+  }, [drawOverlay, socket.sendFrame]);
+
+  const { onFrame } = pose;
+  useEffect(() => {
+    onFrame((r) => {
+      const { drawOverlay: draw, sendFrame } = frameDepsRef.current;
+      draw(r);
       if (recordingRef.current) {
-        console.log('Still recording; reconnecting WebSocket in 500ms...');
-        window.setTimeout(() => {
-          if (recordingRef.current) openSocket();
-        }, 500);
-      }
-    };
-  };
-
-  const closeSocket = () => {
-    try {
-      wsRef.current?.close();
-    } catch {
-      // ignore
-    }
-    wsRef.current = null;
-  };
-
-  const sendPoseFrame = (results: any) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-    const payload = {
-      sessionId,
-      role: roleRef.current,
-      frameIndex: liveFrameIndexRef.current++,
-      timeMs: performance.now(),
-      unixMs: Date.now(),
-      landmarks: serializeLandmarks(results.poseLandmarks),
-      worldLandmarks: serializeLandmarks(results.poseWorldLandmarks),
-    };
-
-    ws.send(JSON.stringify(payload));
-  };
-
-  const ensurePose = async () => {
-    if (poseRef.current) return poseRef.current;
-
-    const poseModule: any = await import('@mediapipe/pose');
-    const drawingModule: any = await import('@mediapipe/drawing_utils');
-
-    const PoseCtor =
-      poseModule.Pose ?? poseModule.default?.Pose ?? poseModule.default ?? null;
-
-    if (!PoseCtor) {
-      throw new Error('Could not load MediaPipe Pose constructor.');
-    }
-
-    const drawingUtils = drawingModule.default ?? drawingModule;
-
-    const pose = new PoseCtor({
-      locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
-    });
-
-    pose.setOptions({
-      modelComplexity: 1,
-      smoothLandmarks: true,
-      enableSegmentation: false,
-      smoothSegmentation: false,
-      minDetectionConfidence: 0.5,
-      minTrackingConfidence: 0.5,
-    });
-
-    pose.onResults((results: any) => {
-      const video = videoRef.current;
-      const overlay = overlayRef.current;
-      if (!video || !overlay) return;
-
-      const ctx = overlay.getContext('2d');
-      if (!ctx) return;
-
-      const width = video.videoWidth || 1280;
-      const height = video.videoHeight || 720;
-
-      if (overlay.width !== width) overlay.width = width;
-      if (overlay.height !== height) overlay.height = height;
-
-      ctx.clearRect(0, 0, width, height);
-
-      if (results.poseLandmarks) {
-        const drawing: any = drawUtilsRef.current ?? drawingUtils;
-
-        const drawConnectors =
-          drawing.drawConnectors ?? drawing.default?.drawConnectors;
-        const drawLandmarks =
-          drawing.drawLandmarks ?? drawing.default?.drawLandmarks;
-        const POSE_CONNECTIONS =
-          drawing.POSE_CONNECTIONS ?? drawing.default?.POSE_CONNECTIONS;
-
-        if (drawConnectors && drawLandmarks && POSE_CONNECTIONS) {
-          drawConnectors(ctx, results.poseLandmarks, POSE_CONNECTIONS, {
-            color: '#00ff88',
-            lineWidth: 6,
-          });
-
-          drawLandmarks(ctx, results.poseLandmarks, {
-            color: '#ffcc00',
-            lineWidth: 2,
-            radius: 4,
-          });
-        }
-
-        const lm = results.poseLandmarks as any[];
-        const labels = [
-          { i: 0, name: 'nose' },
-          { i: 11, name: 'left shoulder' },
-          { i: 12, name: 'right shoulder' },
-          { i: 13, name: 'left elbow' },
-          { i: 14, name: 'right elbow' },
-          { i: 15, name: 'left wrist' },
-          { i: 16, name: 'right wrist' },
-          { i: 23, name: 'left hip' },
-          { i: 24, name: 'right hip' },
-          { i: 25, name: 'left knee' },
-          { i: 26, name: 'right knee' },
-          { i: 27, name: 'left ankle' },
-          { i: 28, name: 'right ankle' },
-        ];
-
-        ctx.font = '16px Arial';
-        ctx.lineWidth = 4;
-
-        for (const item of labels) {
-          const p = lm[item.i];
-          if (!p) continue;
-          if (typeof p.visibility === 'number' && p.visibility < 0.5) continue;
-
-          const x = p.x * width;
-          const y = p.y * height;
-
-          ctx.strokeStyle = '#000000';
-          ctx.fillStyle = '#ffffff';
-          ctx.strokeText(item.name, x + 6, y - 6);
-          ctx.fillText(item.name, x + 6, y - 6);
-        }
-      }
-
-      if (recordingRef.current && results.poseLandmarks) {
-        const now = performance.now();
-        const start = recordingStartRef.current ?? now;
-        const frameIndex = poseFramesRef.current.length;
-
-        const frame: PoseFrame = {
-          frameIndex,
-          t: now,
-          timeMs: now - start,
+        keypointsRef.current.push({
+          seq: keypointsRef.current.length,
+          tMs: r.tCaptureMs,
           unixMs: Date.now(),
-          landmarks: serializeLandmarks(results.poseLandmarks),
-          worldLandmarks: serializeLandmarks(results.poseWorldLandmarks),
-        };
-
-        poseFramesRef.current.push(frame);
-        setKeypointCount(poseFramesRef.current.length);
+          world: toLandmark4(r.worldLandmarks),
+          norm: toLandmark4(r.landmarks),
+        });
       }
-
-      // sendPoseFrame(results);
-      if (recordingRef.current) {
-        sendPoseFrame(results);
-      }
+      sendFrame(r);
     });
+    return () => onFrame(null);
+  }, [onFrame]);
 
-    poseRef.current = pose;
-    drawUtilsRef.current = drawingUtils;
-    setPoseReady(true);
-
-    return pose;
-  };
-
-  const startPoseLoop = async () => {
-    if (!poseRunningRef.current) return;
-    if (!poseRef.current || !videoRef.current) return;
-
-    if (
-      !poseBusyRef.current &&
-      videoRef.current.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
-    ) {
-      poseBusyRef.current = true;
+  const startPreview = useCallback(async () => {
+    const stream = await cam.start();
+    if (!stream) return null; // cam.error is set and shown in the banner
+    const video = videoRef.current;
+    if (video) {
+      video.srcObject = stream;
       try {
-        await poseRef.current.send({ image: videoRef.current });
+        await video.play();
       } catch (err) {
-        console.error('Pose detection error:', err);
-      } finally {
-        poseBusyRef.current = false;
-      }
-    }
-
-    poseLoopRef.current = window.requestAnimationFrame(startPoseLoop);
-  };
-
-  const stopPreview = () => {
-    poseRunningRef.current = false;
-
-    if (poseLoopRef.current != null) {
-      window.cancelAnimationFrame(poseLoopRef.current);
-      poseLoopRef.current = null;
-    }
-
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
-
-    if (videoRef.current) videoRef.current.srcObject = null;
-
-    closeSocket();
-
-    setIsPreviewOn(false);
-    clearOverlay();
-  };
-
-  const startPreview = async () => {
-    stopPreview();
-
-    await ensurePose();
-
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: { ideal: facingMode },
-      },
-      audio: false,
-    });
-
-    streamRef.current = stream;
-
-    if (videoRef.current) {
-      videoRef.current.srcObject = stream;
-      try {
-        await videoRef.current.play();
-      } catch (err) {
-        // A rapid stop/start (or the autoPlay attribute) can interrupt an
-        // in-flight play() with an AbortError. That is benign — the newer
-        // load wins — so swallow it and rethrow anything else.
+        // A rapid stop/start can interrupt play() with a benign AbortError.
         if ((err as { name?: string })?.name !== 'AbortError') throw err;
       }
     }
-
-    // openSocket();
-
-    poseRunningRef.current = true;
-    poseLoopRef.current = window.requestAnimationFrame(startPoseLoop);
+    try {
+      await pose.start();
+    } catch {
+      return null; // pose.error is shown in the banner
+    }
     setIsPreviewOn(true);
-  };
+    return stream;
+  }, [cam, pose]);
 
-  const downloadBlob = (blob: Blob, filename: string) => {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.click();
-    return url;
-  };
+  const stopPreview = useCallback(() => {
+    pose.stop();
+    cam.stop();
+    if (videoRef.current) videoRef.current.srcObject = null;
+    const ctx = overlayRef.current?.getContext('2d');
+    ctx?.clearRect(0, 0, overlayRef.current!.width, overlayRef.current!.height);
+    setIsPreviewOn(false);
+  }, [cam, pose]);
 
-  const startRecording = async () => {
-    if (!streamRef.current) {
-      await startPreview();
-    }
-
-    const stream = streamRef.current;
+  const startRecording = useCallback(async () => {
+    if (recordingRef.current) return;
+    let stream = cam.stream;
+    if (!stream) stream = await startPreview();
     if (!stream) return;
+    setFallbackDownloads([]);
+    rec.start(stream);
+  }, [cam.stream, rec, startPreview]);
 
-    openSocket();
-
-    chunksRef.current = [];
-    poseFramesRef.current = [];
-    setKeypointCount(0);
-    setSeconds(0);
-    setDownloadUrl('');
-    setDownloadName('');
-    setKeypointsUrl('');
-    setKeypointsName('');
-    recordingStartRef.current = performance.now();
-    liveFrameIndexRef.current = 0;
-
-
-    recordingRef.current = true;
-
-    const recorder = mimeType
-      ? new MediaRecorder(stream, { mimeType })
-      : new MediaRecorder(stream);
-
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) chunksRef.current.push(event.data);
-    };
-
-    recorder.onstop = () => {
-      const blob = new Blob(chunksRef.current, {
-        type: mimeType || 'video/webm',
-      });
-
-      const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
-      const name = makeFilename(sessionId, role, ext);
-      const url = downloadBlob(blob, name);
-
-      setDownloadUrl(url);
-      setDownloadName(name);
-
-      const keypointBlob = new Blob([JSON.stringify(poseFramesRef.current, null, 2)], {
-        type: 'application/json',
-      });
-      const keypointName = makeFilename(sessionId, `${role}_keypoints`, 'json');
-      const keypointUrl = downloadBlob(keypointBlob, keypointName);
-
-      setKeypointsUrl(keypointUrl);
-      setKeypointsName(keypointName);
-    };
-
-    recorder.start();
-    recorderRef.current = recorder;
-    setIsRecording(true);
-
-    timerRef.current = window.setInterval(() => {
-      setSeconds((s) => s + 1);
-    }, 1000);
-  };
-
-  const stopRecording = () => {
+  const stopRecording = useCallback(async () => {
     recordingRef.current = false;
+    const result = await rec.stop();
+    if (!result) return;
 
-    if (timerRef.current) {
-      window.clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
+    const ext = result.mimeType.includes('mp4') ? 'mp4' : 'webm';
+    const videoName = makeFilename(sessionId, role, ext);
+    const stem = videoName.slice(0, -(ext.length + 1));
+    const keypointsName = makeFilename(sessionId, `${role}_keypoints`, 'json');
+    const keypointsBlob = new Blob([JSON.stringify(keypointsRef.current)], {
+      type: 'application/json',
+    });
 
-    recorderRef.current?.stop();
-    recorderRef.current = null;
-    recordingStartRef.current = null;
-
-    closeSocket();
-    setIsRecording(false);
-  };
-
-  useEffect(() => {
-    return () => {
-      recordingRef.current = false;
-      poseRunningRef.current = false;
-
-      if (timerRef.current) window.clearInterval(timerRef.current);
-      if (poseLoopRef.current != null) window.cancelAnimationFrame(poseLoopRef.current);
-
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      stopPreview();
+    // Sidecar the offline pipeline reads: `<stem>.annotation.json` sits next to
+    // the video, and `mocap.process` folds it into the clip's meta.json.
+    const annotation = {
+      schemaVersion: 1,
+      sessionId,
+      role,
+      video: videoName,
+      label: label.trim(),
+      notes: notes.trim(),
+      recordedAtUnixMs: Date.now(),
+      durationMs: Math.round(result.durationMs),
+      camera: cam.actual,
+      audio: cam.hasAudio,
+      poseSource: POSE_SOURCE,
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const annotationName = `${stem}.annotation.json`;
+    const annotationBlob = new Blob([JSON.stringify(annotation, null, 2)], {
+      type: 'application/json',
+    });
 
-  // Host's countdown fires: recordSignal increments -> auto-start recording.
-  // Ignores the initial value and no-ops if already recording.
+    // Primary path: upload to the server (Cloudflare-chunk-safe).
+    await uploader.upload({ blob: result.blob, filename: videoName, sessionId, role });
+    await uploader.upload({
+      blob: keypointsBlob,
+      filename: keypointsName,
+      sessionId,
+      role,
+    });
+    await uploader.upload({
+      blob: annotationBlob,
+      filename: annotationName,
+      sessionId,
+      role,
+    });
+
+    // Fallback: offer local downloads (always, so nothing is ever lost).
+    setFallbackDownloads([
+      { url: URL.createObjectURL(result.blob), name: videoName },
+      { url: URL.createObjectURL(keypointsBlob), name: keypointsName },
+      { url: URL.createObjectURL(annotationBlob), name: annotationName },
+    ]);
+  }, [cam.actual, cam.hasAudio, label, notes, rec, role, sessionId, uploader]);
+
+  // Host countdown fires: recordSignal increments -> auto-start recording.
   useEffect(() => {
     if (recordSignal && recordSignal > 0 && !recordingRef.current) {
-      startRecording();
+      void startRecording();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recordSignal]);
+
+  // Release the camera on UNMOUNT ONLY. stopPreview's identity changes across
+  // renders (it closes over the hook objects), so depending on it directly
+  // would run the cleanup — killing the live camera tracks — after every
+  // re-render, and MediaRecorder.start() would then throw NotSupportedError
+  // on the dead stream. Route the latest callback through a ref instead.
+  const stopPreviewRef = useRef(stopPreview);
+  useEffect(() => {
+    stopPreviewRef.current = stopPreview;
+  }, [stopPreview]);
+  useEffect(() => () => stopPreviewRef.current(), []);
 
   return (
     <section className="card">
       <h2>Camera recorder</h2>
       <p>
-        Use this on the iPhones and the Windows computer. Each device records locally in the
-        browser, and a live skeleton overlay shows detected joints.
+        Pick a camera, preview, and record. Recordings upload to the session server
+        automatically; use “Live to robot” to stream the skeleton in real time.
       </p>
+
+      <ErrorBanner message={cam.error?.message ?? null} />
+      <ErrorBanner message={pose.error} />
+      <ErrorBanner message={rec.error} />
+      <ErrorBanner
+        message={uploader.state === 'error' ? `Upload failed: ${uploader.error}` : null}
+      />
+
+      <div className="row wrap" style={{ gap: 8, alignItems: 'center' }}>
+        <label style={{ flex: '1 1 260px' }}>
+          What is this motion?
+          <input
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder="e.g. squatting, waving hello, reaching left"
+            style={{ width: '100%', padding: '4px 8px' }}
+          />
+        </label>
+        <label style={{ flex: '1 1 200px' }}>
+          Notes (optional)
+          <input
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            placeholder="e.g. stumbled at the end"
+            style={{ width: '100%', padding: '4px 8px' }}
+          />
+        </label>
+      </div>
+      {!label.trim() && (
+        <div className="hint">
+          Label the motion before recording — the offline pipeline copies it into
+          the clip metadata, and unlabelled clips are far less useful for training.
+        </div>
+      )}
 
       <div className="row wrap">
         <label>
-          Facing mode
+          Camera
           <select
-            value={facingMode}
-            onChange={(e) => setFacingMode(e.target.value as 'user' | 'environment')}
-            disabled={isRecording}
+            value={cam.deviceId ?? ''}
+            onChange={(e) => cam.setDeviceId(e.target.value)}
+            disabled={rec.isRecording}
           >
-            <option value="user">Front camera</option>
-            <option value="environment">Back camera</option>
+            {cam.devices.length === 0 && <option value="">Default camera</option>}
+            {cam.devices.map((d, i) => (
+              <option key={d.deviceId} value={d.deviceId}>
+                {d.label || `Camera ${i + 1}`}
+              </option>
+            ))}
           </select>
         </label>
 
-        <button className="secondary" onClick={startPreview} disabled={isRecording}>
+        <button
+          className="secondary"
+          onClick={() => void startPreview()}
+          disabled={rec.isRecording}
+        >
           Start preview
         </button>
 
-        <button className="primary" onClick={startRecording} disabled={isRecording}>
+        <button
+          className="primary"
+          onClick={() => void startRecording()}
+          disabled={rec.isRecording}
+        >
           Record
         </button>
 
-        <button className="danger" onClick={stopRecording} disabled={!isRecording}>
+        <button
+          className="danger"
+          onClick={() => void stopRecording()}
+          disabled={!rec.isRecording}
+        >
           Stop
         </button>
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <input
+            type="checkbox"
+            checked={socket.live}
+            onChange={(e) => socket.setLive(e.target.checked)}
+          />
+          Live to robot
+        </label>
+
+        <label
+          style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+          title="Narrate what you're doing while you move — speech paired with motion is training data"
+        >
+          <input
+            type="checkbox"
+            checked={cam.audio}
+            onChange={(e) => cam.setAudio(e.target.checked)}
+            disabled={rec.isRecording}
+          />
+          Record narration audio
+        </label>
       </div>
 
       <div className="metaRow">
-        <span>Status: {isRecording ? 'Recording' : isPreviewOn ? 'Preview ready' : 'Idle'}</span>
-        <span>Elapsed: {seconds}s</span>
-        <span>Mime: {mounted ? mimeType || 'browser default' : 'loading...'}</span>
-        <span>Pose: {poseReady ? 'Ready' : 'Loading...'}</span>
-        <span>Frames: {keypointCount}</span>
+        <span>
+          Status:{' '}
+          {rec.isRecording ? 'Recording' : isPreviewOn ? 'Preview ready' : 'Idle'}
+        </span>
+        <span>Elapsed: {rec.seconds}s</span>
+        <span>
+          Pose:{' '}
+          {pose.status !== 'ready'
+            ? pose.status
+            : `${pose.stats.fps} fps ${
+                pose.stats.detecting ? '· tracking' : '· no person in frame'
+              }`}
+        </span>
+        <span>
+          {cam.actual
+            ? `${cam.actual.width}×${cam.actual.height}@${Math.round(
+                cam.actual.frameRate,
+              )}`
+            : 'camera off'}
+        </span>
+        <span>
+          Link: {socket.live ? `${socket.status} (${socket.framesSent} sent)` : 'off'}
+        </span>
+        <span>Mic: {cam.stream ? (cam.hasAudio ? 'on' : 'off') : '—'}</span>
+        {uploader.state === 'uploading' && (
+          <span>Uploading: {Math.round(uploader.progress * 100)}%</span>
+        )}
+        {uploader.state === 'done' && <span>Uploaded ✓</span>}
       </div>
 
-      <div style={{ position: 'relative', width: '100%' }}>
+      <div
+        style={{
+          position: 'relative',
+          width: '100%',
+          transform: mirrored ? 'scaleX(-1)' : undefined,
+        }}
+      >
         <video ref={videoRef} className="preview" playsInline muted autoPlay />
         <canvas
           ref={overlayRef}
@@ -543,24 +450,28 @@ export default function CameraRecorder({
           }}
         />
       </div>
+      {mirrored && (
+        <div className="hint">Preview is mirrored; recordings are not.</div>
+      )}
 
-      <div className="row wrap">
-        {downloadUrl ? (
-          <a className="secondary" href={downloadUrl} download={downloadName}>
-            Download clip
-          </a>
-        ) : null}
-
-        {keypointsUrl ? (
-          <a className="secondary" href={keypointsUrl} download={keypointsName}>
-            Download keypoints JSON
-          </a>
-        ) : null}
-      </div>
+      {fallbackDownloads.length > 0 && (
+        <div className="row wrap">
+          {uploader.state === 'error' && (
+            <button className="secondary" onClick={uploader.retry}>
+              Retry upload
+            </button>
+          )}
+          {fallbackDownloads.map((f) => (
+            <a key={f.name} className="secondary" href={f.url} download={f.name}>
+              Download {f.name.includes('keypoints') ? 'keypoints' : 'clip'}
+            </a>
+          ))}
+        </div>
+      )}
 
       <div className="hint">
-        Record the full dance, then stop and download the clip plus the keypoints JSON. Later you
-        can run mocap on the saved videos.
+        Record the full move, then Stop. The clip and keypoints upload to the server
+        for offline processing (GVHMR → H1); downloads above are a local backup.
       </div>
     </section>
   );

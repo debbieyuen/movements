@@ -24,8 +24,9 @@ export default function HomePage() {
         <div className="hero card">
           <h1>Motion Capture Studio</h1>
           <p>
-            Open the same session on your iPhones, Windows computer, and Quest 2.
-            Record locally on each device, then use the clips for mocap and retargeting.
+            Record yourself with a single camera. Clips upload to the session server
+            and are processed offline into Unitree H1 motion data — or stream the
+            skeleton live to a MuJoCo robot.
           </p>
 
           <div className="row">

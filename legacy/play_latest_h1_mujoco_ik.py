@@ -18,6 +18,7 @@ Run (from my-app/, with the websocket server running and the browser recording):
 """
 
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -27,7 +28,14 @@ import mujoco
 import mujoco.viewer
 from scipy.optimize import least_squares
 
-RAW_FILE = Path("received_frames/latest_frame.json")
+# The shared protocol package lives at the repo root (one level up).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from server.protocol import COORD_ZUP_XFWD  # noqa: E402
+
+# Canonical v2 live frame written by the websocket server: z-up, depth already
+# compressed at the server boundary (meta.depthScale), landmarks as
+# [x, y, z, visibility] arrays. See server/protocol.py for the convention.
+RAW_FILE = Path("live/latest_pose.json")
 
 # MediaPipe Pose landmark indices.
 NOSE = 0
@@ -40,21 +48,11 @@ L_AN, R_AN = 27, 28
 
 # --- Orientation of the (upright) H1 torso, in world axes ---------------------
 # MuJoCo world: +x forward, +y left, +z up. The robot's own right side is -y.
-# If the whole body looks mirrored or turned around, flip a sign here.
 FORWARD = np.array([1.0, 0.0, 0.0])
 UP = np.array([0.0, 0.0, 1.0])
 RIGHT = np.array([0.0, -1.0, 0.0])
-MP_FORWARD_SIGN = 1.0
 
 STANDING_HEIGHT = 1.0  # pelvis height for kinematic playback
-
-# MediaPipe's depth (z, toward/away from the camera) is far noisier than the
-# image-plane x/y. Left at full weight it turns a visually-straight arm into a
-# bent one (a ~5-degree image bend reads as ~28 degrees in 3D). Compress the
-# depth axis so retargeting leans on the reliable in-plane geometry.
-#   1.0 = raw depth, 0.0 = ignore depth entirely. ~0.35 keeps gross reaching
-#   toward/away from the camera while killing the straight-arm-looks-bent jitter.
-DEPTH_SCALE = 0.35
 
 # We solve each limb (shoulder/hip 3 DOF + elbow/knee) to match BOTH the upper
 # segment direction (shoulder->elbow) AND the lower segment direction
@@ -99,10 +97,13 @@ def _set_background_gray(model: mujoco.MjModel, level: int) -> None:
 # Landmark helpers (shared logic with play_latest_mujoco_ik.py)
 # ---------------------------------------------------------------------------
 def _get_points(frame: Dict) -> List:
-    pts = frame.get("worldLandmarks")
-    if isinstance(pts, list) and pts:
-        return pts
-    pts = frame.get("landmarks")
+    """Return canonical z-up landmarks; refuse frames in any other convention."""
+    coord = frame.get("coord")
+    if coord != COORD_ZUP_XFWD:
+        raise ValueError(
+            f"expected coord={COORD_ZUP_XFWD!r} but got {coord!r} -- "
+            f"is the websocket server writing live/latest_pose.json?")
+    pts = frame.get("world")
     return pts if isinstance(pts, list) else []
 
 
@@ -110,13 +111,11 @@ def _lm(points: List, idx: int, min_vis: float = 0.3) -> Optional[np.ndarray]:
     if idx < 0 or idx >= len(points):
         return None
     p = points[idx]
-    if not isinstance(p, dict) or "x" not in p or "y" not in p or "z" not in p:
+    if not isinstance(p, (list, tuple)) or len(p) < 4:
         return None
-    vis = p.get("visibility")
-    if isinstance(vis, (int, float)) and vis < min_vis:
+    if float(p[3]) < min_vis:
         return None
-    return np.array([float(p["x"]), float(p["y"]), DEPTH_SCALE * float(p["z"])],
-                    dtype=np.float64)
+    return np.array([float(p[0]), float(p[1]), float(p[2])], dtype=np.float64)
 
 
 def _unit(v: np.ndarray) -> Optional[np.ndarray]:
@@ -135,7 +134,7 @@ class TorsoBasis:
         if up is None or right is None:
             raise ValueError("degenerate torso")
         right = _unit(right - np.dot(right, up) * up)
-        forward = _unit(np.cross(up, right)) * MP_FORWARD_SIGN
+        forward = _unit(np.cross(up, right))
         self.right, self.up, self.forward = right, up, forward
 
     def to_robot_world(self, v_mp: np.ndarray) -> Optional[np.ndarray]:
@@ -263,7 +262,7 @@ def build_qpos(ik: H1IK, template_qpos: np.ndarray, frame: Dict):
     report: Dict = {"n_points": 0, "solved": [], "skipped": {}}
     pts = _get_points(frame)
     report["n_points"] = len(pts)
-    report["source"] = "worldLandmarks" if frame.get("worldLandmarks") else "landmarks"
+    report["source"] = f"world ({frame.get('coord')})"
 
     l_sh, r_sh = _lm(pts, L_SH), _lm(pts, R_SH)
     l_hip, r_hip = _lm(pts, L_HIP), _lm(pts, R_HIP)

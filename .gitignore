@@ -1,71 +1,17 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-
-# dependencies
-/node_modules
-/.pnp
-.pnp.js
-
-# testing
-/coverage
-
-# next.js
-/.next/
-/out/
-
-# production
-/build
-
-# misc
-.DS_Store
-*.pem
-
-# debug
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# local env files
-.env*.local
-.env
-
-# vercel
-.vercel
-
-# typescript
-*.tsbuildinfo
-next-env.d.ts
-
-# Node
-node_modules/
-.next/
-out/
-dist/
-
-# Python
+# python
+.venv/
 __pycache__/
 *.pyc
-.venv/
-venv/
+*.egg-info/
 
-# Generated mocap data
+# capture + processing data (never committed; clips are shared out-of-band)
+sessions/
+live/
+dataset/
+inbox/
 received_frames/
-*.jsonl
 
-# Motion recordings
-*_motion.json
-latest_frame.json
-latest_h1_frame.json
-latest_mujoco_frame.json
+# pinned external clones on the GPU box (see docs/GPU_SETUP.md)
+external/
 
-# Videos
-*.mp4
-*.webm
-*.mov
-*.avi
-
-# Logs
-*.log
-
-# VSCode
-.vscode/
-
+.DS_Store
